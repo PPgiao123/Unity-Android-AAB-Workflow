@@ -478,23 +478,83 @@ if (-not $SkipRunner) {
     $cmdText = "@echo off`r`ncd /d ""%~dp0""`r`ncall run.cmd`r`n"
     Set-Content -LiteralPath $startCmd -Value $cmdText -Encoding ASCII
 
-    Write-Host "Requesting runner registration token from GitHub for $Repo..."
-    $tokenRes = Invoke-ExternalProcessChecked -FilePath $gh -ArgumentList @('api', '--method', 'POST', "repos/$Repo/actions/runners/registration-token", '--jq', '.token') -TimeoutSeconds 30
-    $regToken = $tokenRes.Stdout.Trim()
-    if ([string]::IsNullOrWhiteSpace($regToken)) {
-        throw "Failed to obtain runner registration token for $Repo"
+    $dotRunner = Join-Path $RunnerDir '.runner'
+    $dotCreds = Join-Path $RunnerDir '.credentials'
+    $dotCredRsa = Join-Path $RunnerDir '.credentials_rsaparams'
+    $alreadyValid = $false
+
+    if (Test-Path -LiteralPath $dotRunner -PathType Leaf) {
+        if (Test-Path -LiteralPath $dotCreds -PathType Leaf) {
+            try {
+                $runnerCfg = Get-Content -LiteralPath $dotRunner -Raw -Encoding UTF8 | ConvertFrom-Json
+                $cfgUrl = ([string](Get-ConfigProperty -Object $runnerCfg -Name 'gitHubUrl' -Default '')).TrimEnd('/')
+                $cfgName = ([string](Get-ConfigProperty -Object $runnerCfg -Name 'agentName' -Default '')).Trim()
+                $expectedUrl = ("https://github.com/$Repo").TrimEnd('/')
+                if ([string]::Equals($cfgUrl, $expectedUrl, [StringComparison]::OrdinalIgnoreCase) -and -not [string]::IsNullOrWhiteSpace($cfgName)) {
+                    $apiRes = Invoke-ExternalProcessChecked -FilePath $gh -ArgumentList @('api', "repos/$Repo/actions/runners") -TimeoutSeconds 30
+                    $apiObj = $apiRes.Stdout | ConvertFrom-Json
+                    $runnersList = @(Get-ConfigProperty -Object $apiObj -Name 'runners' -Default @())
+                    $matchedRunner = $runnersList | Where-Object {
+                        if ($null -eq $_) { return $false }
+                        $rName = [string](Get-ConfigProperty -Object $_ -Name 'name' -Default '')
+                        $rLabels = @(Get-ConfigProperty -Object $_ -Name 'labels' -Default @() | ForEach-Object { [string](Get-ConfigProperty -Object $_ -Name 'name' -Default '') })
+                        [string]::Equals($rName, $cfgName, [StringComparison]::OrdinalIgnoreCase) -and ($rLabels -contains $RunnerLabel)
+                    } | Select-Object -First 1
+                    if ($null -ne $matchedRunner) {
+                        $alreadyValid = $true
+                        Write-Host "[OK] Local runner '$cfgName' is already registered for $Repo (label: $RunnerLabel); keeping existing registration."
+                    }
+                }
+            } catch {
+                $alreadyValid = $false
+            }
+        }
+
+        if (-not $alreadyValid) {
+            Write-Host "Existing runner config in $RunnerDir is stale or mismatched; removing old local registration..."
+            $rmToken = ''
+            try {
+                $rmRes = Invoke-ExternalProcessChecked -FilePath $gh -ArgumentList @('api', '--method', 'POST', "repos/$Repo/actions/runners/remove-token", '--jq', '.token') -TimeoutSeconds 30
+                $rmToken = $rmRes.Stdout.Trim()
+                if (-not [string]::IsNullOrWhiteSpace($rmToken)) {
+                    $null = Invoke-ExternalProcessChecked -FilePath $configCmd -WorkingDirectory $RunnerDir -ArgumentList @('remove', '--token', $rmToken) -TimeoutSeconds 60
+                }
+            } catch {
+                Write-Warning "Graceful config.cmd remove did not complete cleanly (continuing cleanup): $($_.Exception.Message)"
+            } finally {
+                $rmToken = ''
+            }
+
+            foreach ($staleFile in @($dotRunner, $dotCreds, $dotCredRsa)) {
+                if (Test-Path -LiteralPath $staleFile -PathType Leaf) {
+                    Remove-Item -LiteralPath $staleFile -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
     }
 
-    $null = Invoke-ExternalProcessChecked -FilePath $configCmd -WorkingDirectory $RunnerDir -ArgumentList @(
-        '--url', "https://github.com/$Repo",
-        '--token', $regToken,
-        '--name', $RunnerName,
-        '--labels', $RunnerLabel,
-        '--work', '_work',
-        '--unattended',
-        '--replace'
-    ) -TimeoutSeconds 120
-    $regToken = ''
+    if (-not $alreadyValid) {
+        Write-Host "Requesting runner registration token from GitHub for $Repo..."
+        $tokenRes = Invoke-ExternalProcessChecked -FilePath $gh -ArgumentList @('api', '--method', 'POST', "repos/$Repo/actions/runners/registration-token", '--jq', '.token') -TimeoutSeconds 30
+        $regToken = $tokenRes.Stdout.Trim()
+        if ([string]::IsNullOrWhiteSpace($regToken)) {
+            throw "Failed to obtain runner registration token for $Repo"
+        }
+
+        try {
+            $null = Invoke-ExternalProcessChecked -FilePath $configCmd -WorkingDirectory $RunnerDir -ArgumentList @(
+                '--url', "https://github.com/$Repo",
+                '--token', $regToken,
+                '--name', $RunnerName,
+                '--labels', $RunnerLabel,
+                '--work', '_work',
+                '--unattended',
+                '--replace'
+            ) -TimeoutSeconds 120
+        } finally {
+            $regToken = ''
+        }
+    }
 
     if ($RegisterLogonTask) {
         $taskName = "$projectName-GitHub-Runner"

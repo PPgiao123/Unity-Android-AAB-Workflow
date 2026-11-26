@@ -290,6 +290,9 @@ PlayerSettings:
         if ($setupRaw -notmatch '--git-protocol\s+ssh' -or $setupRaw -notmatch '--skip-ssh-key') {
             throw 'gh auth login must specify --git-protocol ssh and --skip-ssh-key to avoid interactive SSH key upload prompts'
         }
+        if ($setupRaw -notmatch '\.runner' -or $setupRaw -notmatch 'remove-token') {
+            throw 'Setup-GitHub-Runner.ps1 must handle existing .runner registrations idempotently (check .runner + fallback remove-token)'
+        }
 
         $ghPath = 'C:\Program Files\GitHub CLI\gh.exe'
         if (Test-Path -LiteralPath $ghPath -PathType Leaf) {
