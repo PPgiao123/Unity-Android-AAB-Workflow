@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$SampleAabPath = '',
     [string]$SamplePackageName = '',
     [string]$SampleVersionName = '',
@@ -255,6 +255,48 @@ PlayerSettings:
         }
     } else {
         Write-Host '[INFO] No -SampleAabPath supplied; skipping optional real-AAB bundletool integration check.'
+    }
+
+    # 8. GitHub remote auto-detection, gh CLI presence, and zero preset-menu check
+    Run-TestCase 'GitHub remote auto-detection, gh CLI binary check, and zero preset-menu check' {
+        . $commonPath
+        $sshRepo = Resolve-GitHubRepoFromRemoteUrl 'git@github.com:example-org/SampleGame.git'
+        $httpsRepo = Resolve-GitHubRepoFromRemoteUrl 'https://github.com/example-org/SampleGame.git'
+        if ($sshRepo -ne 'example-org/SampleGame' -or $httpsRepo -ne 'example-org/SampleGame') {
+            throw "Remote URL parsing mismatch: ssh='$sshRepo' https='$httpsRepo'"
+        }
+
+        $gitProj = Join-Path $tempWork 'GitAutoDetectGame'
+        New-Item -ItemType Directory -Path (Join-Path $gitProj 'Assets\Resources') -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $gitProj 'ProjectSettings') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path $gitProj 'ProjectSettings\ProjectVersion.txt') -Value 'm_EditorVersion: 6000.3.28f1' -Encoding UTF8
+        Set-Content -LiteralPath (Join-Path $gitProj 'Assets\Resources\Release.json') -Value '{"version":"1.0.0","versionCode":1}' -Encoding UTF8
+        $null = Invoke-ExternalProcessChecked -FilePath 'git.exe' -ArgumentList @('-C', $gitProj, 'init') -TimeoutSeconds 15
+        $null = Invoke-ExternalProcessChecked -FilePath 'git.exe' -ArgumentList @('-C', $gitProj, 'remote', 'add', 'origin', 'git@github.com:example-org/AutoDetectedGame.git') -TimeoutSeconds 15
+
+        $autoSetup = & $setupScript -ProjectPath $gitProj -DryRun
+        if (-not $autoSetup.DryRun -or $autoSetup.Repo -ne 'example-org/AutoDetectedGame' -or $autoSetup.RunnerLabel -ne 'unity-gitautodetectgame') {
+            throw "Auto-detect repo failed: $($autoSetup | Out-String)"
+        }
+
+        $toolRaw = Get-Content -LiteralPath $toolScript -Raw -Encoding UTF8
+        $setupRaw = Get-Content -LiteralPath $setupScript -Raw -Encoding UTF8
+        if ($toolRaw -match 'Get-PresetConfigs' -or $setupRaw -match 'Select Target Unity Project') {
+            throw 'Preset project listing must remain removed from public UI scripts'
+        }
+        if ($toolRaw -match '请选择操作 \[0-5\]' -or $toolRaw -match 'while \(\$true\)') {
+            throw 'Interactive 0-5 multi-option menu must remain removed in favor of 1-click local build'
+        }
+        if ($setupRaw -notmatch '--git-protocol\s+ssh' -or $setupRaw -notmatch '--skip-ssh-key') {
+            throw 'gh auth login must specify --git-protocol ssh and --skip-ssh-key to avoid interactive SSH key upload prompts'
+        }
+
+        $ghPath = 'C:\Program Files\GitHub CLI\gh.exe'
+        if (Test-Path -LiteralPath $ghPath -PathType Leaf) {
+            $ghVer = Invoke-ExternalProcessChecked -FilePath $ghPath -ArgumentList @('--version') -TimeoutSeconds 15
+            if ($ghVer.Stdout -notmatch 'gh version') { throw 'Unexpected gh --version output' }
+            Write-Host "  Detected gh CLI: $($ghVer.Stdout.Trim().Split("`n")[0])"
+        }
     }
 } finally {
     if (Test-Path -LiteralPath $tempWork -PathType Container) {

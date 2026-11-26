@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$ConfigPath = '',
     [string]$ProjectPath = '',
@@ -45,13 +45,41 @@ function Confirm-UserAction {
     }
 }
 
+function Refresh-ProcessPathFromRegistry {
+    $parts = New-Object System.Collections.Generic.List[string]
+    foreach ($scope in @('Machine', 'User')) {
+        try {
+            $val = [Environment]::GetEnvironmentVariable('Path', $scope)
+            if (-not [string]::IsNullOrWhiteSpace($val)) {
+                foreach ($item in ($val -split ';')) {
+                    if (-not [string]::IsNullOrWhiteSpace($item)) { $parts.Add($item.Trim()) }
+                }
+            }
+        } catch {}
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:PATH)) {
+        foreach ($item in ($env:PATH -split ';')) {
+            if (-not [string]::IsNullOrWhiteSpace($item)) { $parts.Add($item.Trim()) }
+        }
+    }
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $unique = New-Object System.Collections.Generic.List[string]
+    foreach ($p in $parts) {
+        if ($seen.Add($p)) { $unique.Add($p) }
+    }
+    $env:PATH = ($unique -join ';')
+}
+
 function Find-GitHubCliPath {
+    Refresh-ProcessPathFromRegistry
     $cmd = Get-Command gh.exe -ErrorAction SilentlyContinue
     if ($null -ne $cmd -and (Test-Path -LiteralPath $cmd.Source -PathType Leaf)) {
         return (Resolve-Path -LiteralPath $cmd.Source).Path
     }
     $defaultPaths = @(
+        'C:\Program Files\GitHub CLI\gh.exe',
         (Join-Path $env:ProgramFiles 'GitHub CLI\gh.exe'),
+        (Join-Path $env:ProgramW6432 'GitHub CLI\gh.exe'),
         (Join-Path ${env:ProgramFiles(x86)} 'GitHub CLI\gh.exe'),
         (Join-Path $env:LOCALAPPDATA 'Programs\GitHub CLI\gh.exe')
     )
@@ -106,14 +134,23 @@ function Install-GitHubCliWithConsent {
         }
         Write-Host "Verified official GitHub CLI MSI SHA-256: $actualSha"
         Write-Host 'Installing GitHub CLI...'
-        $null = Invoke-ExternalProcessChecked -FilePath 'msiexec.exe' -ArgumentList @('/i', $msiPath, '/passive', '/norestart') -TimeoutSeconds 300
+        $msiArgs = Format-WindowsArgumentString -Arguments @('/i', $msiPath, '/passive', '/norestart')
+        $msiProc = Start-Process -FilePath 'msiexec.exe' -ArgumentList $msiArgs -PassThru -Wait
+        if ($msiProc.ExitCode -notin @(0, 3010)) {
+            throw "GitHub CLI MSI installation failed with exit code $($msiProc.ExitCode)."
+        }
     } finally {
         if (Test-Path -LiteralPath $tmpDir -PathType Container) {
             Remove-Item -LiteralPath $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
 
-    $installedGh = Find-GitHubCliPath
+    $installedGh = $null
+    for ($waitIdx = 0; $waitIdx -lt 15; $waitIdx++) {
+        $installedGh = Find-GitHubCliPath
+        if (-not [string]::IsNullOrWhiteSpace($installedGh)) { break }
+        Start-Sleep -Seconds 1
+    }
     if ([string]::IsNullOrWhiteSpace($installedGh)) {
         throw 'GitHub CLI installation finished, but gh.exe was not found on disk. Reopen terminal or check Program Files\GitHub CLI.'
     }
@@ -156,49 +193,28 @@ function Set-GitHubSecretFromStdin {
     }
 }
 
-# 1. Interactive or config-driven target selection
-if ([string]::IsNullOrWhiteSpace($ConfigPath) -and ([string]::IsNullOrWhiteSpace($ProjectPath) -or [string]::IsNullOrWhiteSpace($Repo))) {
-    if ($NonInteractive) {
-        throw 'Provide -ConfigPath, or both -ProjectPath and -Repo when running with -NonInteractive.'
-    }
-    $presetFiles = New-Object System.Collections.Generic.List[System.IO.FileInfo]
-    foreach ($dirName in @('local-config', 'config')) {
-        $dirPath = Join-Path $PSScriptRoot $dirName
-        if (-not (Test-Path -LiteralPath $dirPath -PathType Container)) { continue }
-        foreach ($f in @(Get-ChildItem -LiteralPath $dirPath -Filter '*.json' -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'project.example.json' } | Sort-Object Name)) {
-            $presetFiles.Add($f)
-        }
-    }
+# 1. Resolve target Unity project & GitHub repository (generic direct input, zero preset list)
+$explicitRepo = -not [string]::IsNullOrWhiteSpace($Repo)
+$explicitKs = -not [string]::IsNullOrWhiteSpace($KeystorePath)
+$explicitAlias = -not [string]::IsNullOrWhiteSpace($KeyAlias)
+$explicitRunnerDir = -not [string]::IsNullOrWhiteSpace($RunnerDir)
 
-    Write-Host '=== Select Target Unity Project & GitHub Repository ==='
-    for ($i = 0; $i -lt $presetFiles.Count; $i++) {
-        $cObj = Get-Content -LiteralPath $presetFiles[$i].FullName -Raw -Encoding UTF8 | ConvertFrom-Json
-        $cRepo = [string](Get-ConfigProperty -Object (Get-ConfigProperty -Object $cObj -Name 'release') -Name 'githubRepo' -Default '')
-        $cProj = [string](Get-ConfigProperty -Object $cObj -Name 'projectPath' -Default '')
-        Write-Host ("  [{0}] {1}  ({2}) -> {3}" -f ($i + 1), $cObj.projectName, $cRepo, $cProj)
+if ([string]::IsNullOrWhiteSpace($ConfigPath) -and [string]::IsNullOrWhiteSpace($ProjectPath)) {
+    if ($NonInteractive) {
+        throw 'Provide -ProjectPath (or -ConfigPath) when running with -NonInteractive.'
     }
-    Write-Host '  [0] Enter custom Unity project path & GitHub owner/repo'
-    $choice = (Read-Host 'Choose target number').Trim()
-    if ($choice -match '^\d+$') {
-        $idx = [int]$choice
-        if ($idx -ge 1 -and $idx -le $presetFiles.Count) {
-            $ConfigPath = $presetFiles[$idx - 1].FullName
-        } elseif ($idx -eq 0) {
-            $Repo = (Read-Host 'Enter GitHub repository (owner/repo, e.g. myorg/MyUnityGame)').Trim()
-            Add-Type -AssemblyName System.Windows.Forms
-            $picker = New-Object System.Windows.Forms.FolderBrowserDialog
-            $picker.Description = 'Select Unity project root folder (containing Assets and ProjectSettings)'
-            try {
-                if ($picker.ShowDialog() -ne [Windows.Forms.DialogResult]::OK) { return }
-                $ProjectPath = $picker.SelectedPath
-            } finally {
-                $picker.Dispose()
-            }
-        } else {
-            throw "Invalid selection: $choice"
-        }
-    } else {
-        throw "Invalid selection: $choice"
+    Write-Host ''
+    Write-Host '=== 选择目标 Unity 工程 ==='
+    $ProjectPath = Prompt-DirectoryOrBrowse `
+        -PromptText '请输入 Unity 工程根目录路径（直接回车打开文件夹选择框）' `
+        -DialogDescription '选择 Unity 工程根目录（包含 Assets 和 ProjectSettings）'
+    if ([string]::IsNullOrWhiteSpace($ProjectPath)) { return }
+}
+
+if ([string]::IsNullOrWhiteSpace($ConfigPath) -and -not [string]::IsNullOrWhiteSpace($ProjectPath)) {
+    $matchedLocal = Find-LocalConfigForProject -ToolRoot $PSScriptRoot -ProjectPath $ProjectPath
+    if (-not [string]::IsNullOrWhiteSpace($matchedLocal)) {
+        $ConfigPath = $matchedLocal
     }
 }
 
@@ -216,22 +232,6 @@ $relCfg = Get-ConfigProperty -Object $cfg -Name 'release'
 if ([string]::IsNullOrWhiteSpace($ProjectPath)) {
     $ProjectPath = [string](Get-ConfigProperty -Object $cfg -Name 'projectPath' -Default '')
 }
-if ([string]::IsNullOrWhiteSpace($Repo)) {
-    $Repo = [string](Get-ConfigProperty -Object $relCfg -Name 'githubRepo' -Default '')
-}
-if ([string]::IsNullOrWhiteSpace($KeystorePath)) {
-    $KeystorePath = [string](Get-ConfigProperty -Object $signCfg -Name 'keystorePath' -Default '')
-}
-if ([string]::IsNullOrWhiteSpace($KeyAlias)) {
-    $KeyAlias = [string](Get-ConfigProperty -Object $signCfg -Name 'keyAlias' -Default '')
-}
-if ([string]::IsNullOrWhiteSpace($ExpectedCertificateSha256)) {
-    $ExpectedCertificateSha256 = [string](Get-ConfigProperty -Object $signCfg -Name 'expectedCertificateSha256' -Default '')
-}
-
-if ($Repo -notmatch '^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$') {
-    throw "Invalid GitHub repository '$Repo'. Expected format: owner/repo."
-}
 
 $releaseJsonRel = [string](Get-ConfigProperty -Object $cfg -Name 'releaseJsonPath' -Default '')
 $meta = Read-UnityProjectMetadata -ProjectPath $ProjectPath -ReleaseJsonRelativePath $releaseJsonRel
@@ -239,21 +239,69 @@ $projectName = [string](Get-ConfigProperty -Object $cfg -Name 'projectName' -Def
 $slug = ($projectName -replace '[^A-Za-z0-9_-]', '').ToLowerInvariant()
 if ([string]::IsNullOrWhiteSpace($slug)) { $slug = 'unity-app' }
 
+if ([string]::IsNullOrWhiteSpace($Repo)) {
+    $Repo = [string](Get-ConfigProperty -Object $relCfg -Name 'githubRepo' -Default '')
+}
+if ([string]::IsNullOrWhiteSpace($Repo)) {
+    $Repo = Resolve-GitHubRepoFromProject -ProjectPath $meta.ProjectPath
+}
+if (-not $explicitRepo -and -not $NonInteractive -and -not $DryRun) {
+    $repoPrompt = if ([string]::IsNullOrWhiteSpace($Repo)) {
+        '请输入 GitHub 仓库 (格式 owner/repo)'
+    } else {
+        "请输入 GitHub 仓库 (owner/repo，回车默认: $Repo)"
+    }
+    $inRepo = (Read-Host $repoPrompt).Trim()
+    if (-not [string]::IsNullOrWhiteSpace($inRepo)) { $Repo = $inRepo }
+}
+if ($Repo -notmatch '^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$') {
+    throw "Invalid GitHub repository '$Repo'. Expected format: owner/repo."
+}
+
+if ([string]::IsNullOrWhiteSpace($KeystorePath)) {
+    $KeystorePath = [string](Get-ConfigProperty -Object $signCfg -Name 'keystorePath' -Default '')
+}
+if ([string]::IsNullOrWhiteSpace($KeystorePath)) {
+    $KeystorePath = Join-Path $env:USERPROFILE ".unity-aab-keys\$slug-upload.p12"
+}
+if (-not $explicitKs -and -not $NonInteractive -and -not $DryRun) {
+    $inKs = (Read-Host "请输入上传密钥库 .p12 路径 (回车默认: $KeystorePath)").Trim().Trim('"', "'")
+    if (-not [string]::IsNullOrWhiteSpace($inKs)) { $KeystorePath = $inKs }
+}
+
+if ([string]::IsNullOrWhiteSpace($KeyAlias)) {
+    $KeyAlias = [string](Get-ConfigProperty -Object $signCfg -Name 'keyAlias' -Default '')
+}
+if ([string]::IsNullOrWhiteSpace($KeyAlias)) {
+    $KeyAlias = "$slug-upload"
+}
+if (-not $explicitAlias -and -not $NonInteractive -and -not $DryRun) {
+    $inAlias = (Read-Host "请输入密钥库 Key Alias (回车默认: $KeyAlias)").Trim()
+    if (-not [string]::IsNullOrWhiteSpace($inAlias)) { $KeyAlias = $inAlias }
+}
+
+if ([string]::IsNullOrWhiteSpace($ExpectedCertificateSha256)) {
+    $ExpectedCertificateSha256 = [string](Get-ConfigProperty -Object $signCfg -Name 'expectedCertificateSha256' -Default '')
+}
+
 if ([string]::IsNullOrWhiteSpace($RunnerDir)) {
-    $runnerBase = Join-Path $env:SystemDrive 'actions-runner'
+    $runnerBase = if (Test-Path -LiteralPath 'D:\actions-runner' -PathType Container) {
+        'D:\actions-runner'
+    } else {
+        Join-Path $env:SystemDrive 'actions-runner'
+    }
     $RunnerDir = Join-Path $runnerBase $slug
 }
+if (-not $explicitRunnerDir -and -not $NonInteractive -and -not $DryRun) {
+    $inRunner = (Read-Host "请输入本机 Runner 安装目录 (回车默认: $RunnerDir)").Trim().Trim('"', "'")
+    if (-not [string]::IsNullOrWhiteSpace($inRunner)) { $RunnerDir = $inRunner }
+}
+
 if ([string]::IsNullOrWhiteSpace($RunnerLabel)) {
     $RunnerLabel = "unity-$slug"
 }
 if ([string]::IsNullOrWhiteSpace($RunnerName)) {
     $RunnerName = "$($env:COMPUTERNAME)-$slug-unity"
-}
-if ([string]::IsNullOrWhiteSpace($KeyAlias)) {
-    $KeyAlias = "$slug-upload"
-}
-if ([string]::IsNullOrWhiteSpace($KeystorePath)) {
-    $KeystorePath = Join-Path $env:USERPROFILE ".unity-aab-keys\$slug-upload.p12"
 }
 
 Write-Host ''
@@ -291,7 +339,7 @@ try {
 }
 if (-not $authCheckOk) {
     Write-Host 'Opening browser to authorize GitHub CLI (repo + workflow scopes)...'
-    & $gh auth login --hostname github.com --web --scopes repo,workflow
+    & $gh auth login --hostname github.com --git-protocol ssh --skip-ssh-key --web --clipboard --scopes repo,workflow
     if ($LASTEXITCODE -ne 0) {
         throw 'GitHub CLI authentication failed.'
     }

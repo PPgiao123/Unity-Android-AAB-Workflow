@@ -1,4 +1,4 @@
-Set-StrictMode -Version Latest
+﻿Set-StrictMode -Version Latest
 
 function Format-WindowsArgumentString([string[]]$Arguments) {
     if ($null -eq $Arguments -or $Arguments.Count -eq 0) {
@@ -565,5 +565,77 @@ function Wipe-FileSecurely([string]$Path) {
         }
     } finally {
         Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Resolve-GitHubRepoFromRemoteUrl([string]$RemoteUrl) {
+    if ([string]::IsNullOrWhiteSpace($RemoteUrl)) { return '' }
+    $u = $RemoteUrl.Trim()
+    if ($u -match '^(?:git@github\.com:|ssh://git@github\.com/|https?://(?:[^@]+@)?github\.com/)([A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+?)(?:\.git)?/?$') {
+        return $Matches[1]
+    }
+    return ''
+}
+
+function Resolve-GitHubRepoFromProject([string]$ProjectPath) {
+    if ([string]::IsNullOrWhiteSpace($ProjectPath) -or -not (Test-Path -LiteralPath $ProjectPath -PathType Container)) {
+        return ''
+    }
+    $gitCmd = Get-Command git.exe -ErrorAction SilentlyContinue
+    if ($null -eq $gitCmd) { return '' }
+    try {
+        $res = Invoke-ExternalProcessChecked -FilePath $gitCmd.Source -ArgumentList @('-C', $ProjectPath, 'remote', 'get-url', 'origin') -TimeoutSeconds 10
+        return (Resolve-GitHubRepoFromRemoteUrl -RemoteUrl $res.Stdout)
+    } catch {
+        return ''
+    }
+}
+
+function Find-LocalConfigForProject {
+    param(
+        [Parameter(Mandatory = $true)][string]$ToolRoot,
+        [Parameter(Mandatory = $true)][string]$ProjectPath
+    )
+    $localDir = Join-Path $ToolRoot 'local-config'
+    if (-not (Test-Path -LiteralPath $localDir -PathType Container)) { return '' }
+    $targetNorm = ''
+    try { $targetNorm = (Resolve-Path -LiteralPath $ProjectPath).Path.TrimEnd('\', '/') } catch { $targetNorm = $ProjectPath.TrimEnd('\', '/') }
+    $files = @(Get-ChildItem -LiteralPath $localDir -Filter '*.json' -File -ErrorAction SilentlyContinue | Sort-Object Name)
+    foreach ($f in $files) {
+        try {
+            $obj = Get-Content -LiteralPath $f.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+            $cfgProj = [string](Get-ConfigProperty -Object $obj -Name 'projectPath' -Default '')
+            if ([string]::IsNullOrWhiteSpace($cfgProj)) { continue }
+            $cfgNorm = ''
+            try { $cfgNorm = (Resolve-Path -LiteralPath $cfgProj).Path.TrimEnd('\', '/') } catch { $cfgNorm = $cfgProj.TrimEnd('\', '/') }
+            if ([string]::Equals($cfgNorm, $targetNorm, [StringComparison]::OrdinalIgnoreCase)) {
+                return $f.FullName
+            }
+        } catch {}
+    }
+    return ''
+}
+
+function Prompt-DirectoryOrBrowse {
+    param(
+        [string]$PromptText = '请输入 Unity 工程根目录路径（直接回车打开文件夹选择框）',
+        [string]$DialogDescription = '选择 Unity 工程根目录（包含 Assets 和 ProjectSettings）'
+    )
+    $raw = (Read-Host $PromptText)
+    if (-not [string]::IsNullOrWhiteSpace($raw)) {
+        $cleaned = $raw.Trim().Trim('"', "'")
+        if (-not (Test-Path -LiteralPath $cleaned -PathType Container)) {
+            throw "指定的目录不存在: $cleaned"
+        }
+        return (Resolve-Path -LiteralPath $cleaned).Path
+    }
+    Add-Type -AssemblyName System.Windows.Forms
+    $picker = New-Object System.Windows.Forms.FolderBrowserDialog
+    $picker.Description = $DialogDescription
+    try {
+        if ($picker.ShowDialog() -ne [Windows.Forms.DialogResult]::OK) { return '' }
+        return (Resolve-Path -LiteralPath $picker.SelectedPath).Path
+    } finally {
+        $picker.Dispose()
     }
 }

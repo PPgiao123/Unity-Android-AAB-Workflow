@@ -3,28 +3,28 @@
 A universal, zero-secret-leakage toolchain for building, signing, and verifying Google Play Android App Bundles (`.aab`) for any Unity project on Windows — either **locally in one click** or via a **GitHub Actions Self-Hosted Runner**.
 
 ```text
-Unity-AAB-Tool.cmd (Unified Menu)
-  ├── [1] Local Build + Sign + Verify AAB (Unity CLI / Editor -> Gradle -> Sign -> Gate)
-  ├── [2] Setup GitHub Secrets & Self-Hosted Runner (Auto-installs gh with consent)
-  ├── [3] Generate PKCS12 Upload Keystore / Inspect Certificate SHA-256
-  ├── [4] Verify an Existing .aab (bundletool + Manifest + arm64 + 16KB ELF + jarsigner)
-  └── [5] Check Local Environment (Unity CLI, Unity Editor, AndroidPlayer, bundletool)
+Unity-AAB-Tool.cmd (Direct 1-Click Local Build)
+  ├── 1. Pick Unity project directory (or drag & drop path)
+  ├── 2. Silently detect Unity Editor / AndroidPlayer / bundletool & release info
+  ├── 3. Auto-use or create upload .p12 keystore (single in-memory password prompt)
+  ├── 4. Build + Sign + Verify AAB & highlight the .aab in Explorer
+  └── 5. Optional [y/N]: Configure GitHub Secrets & Self-Hosted Runner
 ```
 
 ---
 
 ## Quick Start
 
-Double-click **`Unity-AAB-Tool.cmd`** in the repository root and choose an option from the menu, or invoke any option directly from PowerShell:
+Double-click **`Unity-AAB-Tool.cmd`** in the repository root, pick your Unity project folder, enter the keystore password once, and it builds, signs, and verifies your `.aab` directly — no menus or manual environment checks.
+
+For scripting or CI automation, invoke individual actions directly from PowerShell:
 
 ```powershell
-# Interactive menu
-.\Unity-AAB-Tool.cmd
-
 # Direct CLI examples
-powershell -NoProfile -ExecutionPolicy Bypass -File ".\Unity-AAB-Tool.ps1" -Action checkenv -ProjectPath "C:\Projects\MyUnityGame"
 powershell -NoProfile -ExecutionPolicy Bypass -File ".\Unity-AAB-Tool.ps1" -Action build -ProjectPath "C:\Projects\MyUnityGame" -QaSigning
+powershell -NoProfile -ExecutionPolicy Bypass -File ".\Unity-AAB-Tool.ps1" -Action verify -AabPath ".\out\MyGame.aab"
 powershell -NoProfile -ExecutionPolicy Bypass -File ".\Unity-AAB-Tool.ps1" -Action setup
+powershell -NoProfile -ExecutionPolicy Bypass -File ".\Unity-AAB-Tool.ps1" -Action checkenv -ProjectPath "C:\Projects\MyUnityGame"
 ```
 
 ---
@@ -57,8 +57,8 @@ Copy [config/project.example.json](config/project.example.json) into `local-conf
 ## Self-Hosted GitHub Actions Usage
 
 1. Copy [workflows/caller-selfhosted-aab.yml](workflows/caller-selfhosted-aab.yml) into your Unity repository as `.github/workflows/android-aab.yml` and replace the `__PROJECT_NAME__`, `__RUNNER_LABEL__`, `__CONFIG_FILE__`, and `<OWNER>` placeholders (or pass inline `-PackageName`, `-ExecuteMethod`, `-RequiredPermissions`, `-RequiredMetaData` parameters to `Build-Unity-Aab.ps1`).
-2. Run `Unity-AAB-Tool.cmd` -> `[2] 一键配置 GitHub Secrets 与本机 Runner` to upload your 4 signing Secrets and bind your local runner.
-3. Whenever you want a signed AAB: launch `Start-<Project>-Runner.cmd` on Windows and click **`Run workflow`** on GitHub Actions, then download the verified `.aab` from Artifacts (or Draft Release) and upload it to Google Play Console.
+2. Run `Unity-AAB-Tool.cmd` (answer `y` when prompted after a local build) or `powershell -NoProfile -ExecutionPolicy Bypass -File ".\Unity-AAB-Tool.ps1" -Action setup` to upload your 4 encrypted signing Secrets once and bind your local runner (no plaintext passwords are ever saved locally, and future GitHub Actions runs require zero password prompts).
+3. Whenever you want a signed AAB: launch `Start-MyUnityGame-Runner.cmd` on Windows and click **`Run workflow`** in `example-org/MyUnityGame` on GitHub Actions, then download the verified `.aab` from Artifacts (or Draft Release) and upload it to Google Play Console.
 
 ---
 
@@ -66,7 +66,7 @@ Copy [config/project.example.json](config/project.example.json) into `local-conf
 
 | File | Description |
 | :--- | :--- |
-| `Unity-AAB-Tool.cmd` / `Unity-AAB-Tool.ps1` | Unified interactive menu & CLI dispatcher |
+| `Unity-AAB-Tool.cmd` / `Unity-AAB-Tool.ps1` | Direct 1-click local AAB builder & CLI action dispatcher |
 | `Build-Unity-Aab.ps1` | Unity CLI / Editor staging AAB builder + signing + verification orchestrator |
 | `Sign-Aab.ps1` | Keystore generator, cert SHA-256 exporter, and post-build `jarsigner` signer |
 | `Verify-Aab.ps1` | Standalone Google Play AAB gate (`bundletool` + Manifest + `arm64-v8a` + 16 KB ELF + `jarsigner`) |

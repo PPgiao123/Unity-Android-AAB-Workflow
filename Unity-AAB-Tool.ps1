@@ -17,54 +17,17 @@ Set-StrictMode -Version Latest
 
 . (Join-Path $PSScriptRoot 'tools\Common.ps1')
 
-function Get-PresetConfigs {
-    $items = New-Object System.Collections.Generic.List[object]
-    foreach ($dirName in @('local-config', 'config')) {
-        $dir = Join-Path $PSScriptRoot $dirName
-        if (-not (Test-Path -LiteralPath $dir -PathType Container)) { continue }
-        $files = @(Get-ChildItem -LiteralPath $dir -Filter '*.json' -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -ne 'project.example.json' } |
-            Sort-Object Name)
-        foreach ($f in $files) {
-            try {
-                $obj = Get-Content -LiteralPath $f.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
-                $items.Add([PSCustomObject]@{
-                    Path        = $f.FullName
-                    ProjectName = [string](Get-ConfigProperty -Object $obj -Name 'projectName' -Default $f.BaseName)
-                    ProjectPath = [string](Get-ConfigProperty -Object $obj -Name 'projectPath' -Default '')
-                    Repo        = [string](Get-ConfigProperty -Object (Get-ConfigProperty -Object $obj -Name 'release') -Name 'githubRepo' -Default '')
-                })
-            } catch {}
-        }
-    }
-    return $items.ToArray()
-}
-
-function Select-ProjectOrConfig([string]$PromptTitle) {
-    $presets = @(Get-PresetConfigs)
-    if ($presets.Count -gt 0) {
-        Write-Host ''
-        Write-Host "=== $PromptTitle ==="
-        for ($i = 0; $i -lt $presets.Count; $i++) {
-            Write-Host ("  [{0}] {1} ({2})" -f ($i + 1), $presets[$i].ProjectName, $presets[$i].ProjectPath)
-        }
-        Write-Host '  [0] 选择其他 Unity 工程文件夹 (Browse Folder)'
-        $sel = (Read-Host '请输入编号').Trim()
-        if ($sel -match '^\d+$') {
-            $idx = [int]$sel
-            if ($idx -ge 1 -and $idx -le $presets.Count) {
-                return [PSCustomObject]@{ ConfigPath = $presets[$idx - 1].Path; ProjectPath = '' }
-            }
-        }
-    }
-    Add-Type -AssemblyName System.Windows.Forms
-    $picker = New-Object System.Windows.Forms.FolderBrowserDialog
-    $picker.Description = '选择 Unity 工程根目录（包含 Assets 和 ProjectSettings）'
-    try {
-        if ($picker.ShowDialog() -ne [Windows.Forms.DialogResult]::OK) { return $null }
-        return [PSCustomObject]@{ ConfigPath = ''; ProjectPath = $picker.SelectedPath }
-    } finally {
-        $picker.Dispose()
+function Select-ProjectPath([string]$PromptTitle) {
+    Write-Host ''
+    Write-Host "=== $PromptTitle ==="
+    $chosen = Prompt-DirectoryOrBrowse `
+        -PromptText '请输入 Unity 工程根目录路径（直接回车打开文件夹选择框）' `
+        -DialogDescription '选择 Unity 工程根目录（包含 Assets 和 ProjectSettings）'
+    if ([string]::IsNullOrWhiteSpace($chosen)) { return $null }
+    $matchedCfg = Find-LocalConfigForProject -ToolRoot $PSScriptRoot -ProjectPath $chosen
+    return [PSCustomObject]@{
+        ConfigPath  = $matchedCfg
+        ProjectPath = $chosen
     }
 }
 
@@ -91,10 +54,10 @@ function Invoke-Action([string]$SelectedAction) {
             if ($PrepareOnly) { $params['PrepareOnly'] = $true }
 
             if ([string]::IsNullOrWhiteSpace($ConfigPath) -and [string]::IsNullOrWhiteSpace($ProjectPath)) {
-                $target = Select-ProjectOrConfig '选择要出包的 Unity 工程'
+                $target = Select-ProjectPath '选择要出包的 Unity 工程'
                 if ($null -eq $target) { return }
                 if ($target.ConfigPath) { $params['ConfigPath'] = $target.ConfigPath }
-                if ($target.ProjectPath) { $params['ProjectPath'] = $target.ProjectPath }
+                $params['ProjectPath'] = $target.ProjectPath
 
                 if (-not $QaSigning -and -not $PrepareOnly) {
                     Write-Host ''
@@ -161,10 +124,10 @@ function Invoke-Action([string]$SelectedAction) {
             if (-not [string]::IsNullOrWhiteSpace($ConfigPath)) { $params['ConfigPath'] = $ConfigPath }
             if (-not [string]::IsNullOrWhiteSpace($ProjectPath)) { $params['ProjectPath'] = $ProjectPath }
             if ([string]::IsNullOrWhiteSpace($ConfigPath) -and [string]::IsNullOrWhiteSpace($ProjectPath)) {
-                $target = Select-ProjectOrConfig '选择要自检的 Unity 工程'
+                $target = Select-ProjectPath '选择要自检的 Unity 工程'
                 if ($null -eq $target) { return }
                 if ($target.ConfigPath) { $params['ConfigPath'] = $target.ConfigPath }
-                if ($target.ProjectPath) { $params['ProjectPath'] = $target.ProjectPath }
+                $params['ProjectPath'] = $target.ProjectPath
             }
             & (Join-Path $PSScriptRoot 'Build-Unity-Aab.ps1') @params
         }
@@ -180,31 +143,158 @@ if ($NonInteractive) {
     throw 'Specify -Action when running with -NonInteractive.'
 }
 
-while ($true) {
+function Invoke-OneClickLocalAabBuild {
     Write-Host ''
     Write-Host '================================================='
-    Write-Host '         Unity Android AAB 一键工具箱'
+    Write-Host '      Unity Android AAB 一键打包 (本地直接出包)'
     Write-Host '================================================='
-    Write-Host '  [1] 本地一键出包并验包 (Build + Sign + Verify)'
-    Write-Host '  [2] 一键配置 GitHub Secrets 与本机 Runner (自动装 gh)'
-    Write-Host '  [3] 生成新上传密钥库 (.p12) 或查看证书指纹'
-    Write-Host '  [4] 单独验包现有 .aab (bundletool / 16KB ELF / 验签)'
-    Write-Host '  [5] 检测本机 Unity / Android / bundletool 环境'
-    Write-Host '  [0] 退出'
-    Write-Host '================================================='
-    $choice = (Read-Host '请选择操作 [0-5]').Trim()
-    switch ($choice) {
-        '1' { Invoke-Action 'build' }
-        '2' { Invoke-Action 'setup' }
-        '3' {
-            Write-Host '  [a] 生成新上传密钥库 (.p12)'
-            Write-Host '  [b] 查看现有密钥库公钥 SHA-256'
-            $sub = (Read-Host '请选择 [a/b]').Trim().ToLowerInvariant()
-            if ($sub -eq 'b') { Invoke-Action 'certinfo' } else { Invoke-Action 'keygen' }
+
+    $target = Select-ProjectPath '选择 Unity 工程目录'
+    if ($null -eq $target) { return }
+
+    $meta = Read-UnityProjectMetadata -ProjectPath $target.ProjectPath
+    $editorPath = Find-UnityEditor -EditorVersion $meta.EditorVersion
+    if ([string]::IsNullOrWhiteSpace($editorPath)) {
+        throw "未找到匹配 Unity $($meta.EditorVersion) 的编辑器，请确认 Unity Hub 已安装对应版本及 Android Build Support。"
+    }
+    $null = Find-AndroidPlayerTools -UnityEditorPath $editorPath -EditorVersion $meta.EditorVersion
+
+    Write-Host ("[工程就绪] {0} | 包名: {1} | 版本: {2} (code {3}) | Unity {4}" -f `
+        $meta.ProjectName, $meta.PackageName, $meta.VersionName, $meta.VersionCode, $meta.EditorVersion)
+
+    $slug = ($meta.ProjectName -replace '[^A-Za-z0-9._-]+', '-').Trim('-').ToLowerInvariant()
+    if ([string]::IsNullOrWhiteSpace($slug)) { $slug = 'app' }
+
+    $defaultKs = Join-Path $env:USERPROFILE ".unity-aab-keys\$slug-upload.p12"
+    $defaultAlias = "$slug-upload"
+    $cfgKs = ''
+    $cfgAlias = ''
+    $cfgSha = ''
+    if (-not [string]::IsNullOrWhiteSpace($target.ConfigPath) -and (Test-Path -LiteralPath $target.ConfigPath -PathType Leaf)) {
+        $cfgObj = Get-Content -LiteralPath $target.ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $signCfg = Get-ConfigProperty -Object $cfgObj -Name 'signing' -Default $null
+        $cfgKs = [string](Get-ConfigProperty -Object $signCfg -Name 'keystorePath' -Default '')
+        $cfgAlias = [string](Get-ConfigProperty -Object $signCfg -Name 'keyAlias' -Default '')
+        $cfgSha = [string](Get-ConfigProperty -Object $signCfg -Name 'expectedCertificateSha256' -Default '')
+        if (-not [string]::IsNullOrWhiteSpace($cfgKs)) { $defaultKs = $cfgKs }
+        if (-not [string]::IsNullOrWhiteSpace($cfgAlias)) { $defaultAlias = $cfgAlias }
+    }
+
+    $resolvedKs = $KeystorePath
+    if ([string]::IsNullOrWhiteSpace($resolvedKs)) {
+        $inKs = (Read-Host "签名密钥路径 .p12（直接回车使用默认: $defaultKs）").Trim().Trim('"', "'")
+        $resolvedKs = if ([string]::IsNullOrWhiteSpace($inKs)) { $defaultKs } else { $inKs }
+    }
+
+    $resolvedAlias = $KeyAlias
+    if ([string]::IsNullOrWhiteSpace($resolvedAlias)) {
+        if (-not [string]::IsNullOrWhiteSpace($cfgAlias) -and [string]::Equals($resolvedKs, $cfgKs, [StringComparison]::OrdinalIgnoreCase)) {
+            $resolvedAlias = $cfgAlias
+        } else {
+            $inAlias = (Read-Host "Key Alias（直接回车使用默认: $defaultAlias）").Trim()
+            $resolvedAlias = if ([string]::IsNullOrWhiteSpace($inAlias)) { $defaultAlias } else { $inAlias }
         }
-        '4' { Invoke-Action 'verify' }
-        '5' { Invoke-Action 'checkenv' }
-        '0' { return }
-        default { Write-Host "无效选项: $choice" }
+    }
+
+    $expectedCert = ''
+    if (-not [string]::IsNullOrWhiteSpace($cfgSha) -and [string]::Equals($resolvedKs, $cfgKs, [StringComparison]::OrdinalIgnoreCase)) {
+        $expectedCert = $cfgSha
+    }
+
+    $origStorePw = [Environment]::GetEnvironmentVariable('UNITY_AAB_STORE_PASSWORD')
+    $hadStorePw = -not [string]::IsNullOrEmpty($origStorePw)
+
+    try {
+        if (-not $hadStorePw) {
+            $creatingNew = -not (Test-Path -LiteralPath $resolvedKs -PathType Leaf)
+            $promptMsg = if ($creatingNew) {
+                '首次使用将自动生成上传密钥库，请设置密码（至少 6 位）'
+            } else {
+                "请输入签名密钥密码 ($resolvedAlias)"
+            }
+            $sec = Read-Host $promptMsg -AsSecureString
+            $plain = ([Net.NetworkCredential]::new('', $sec)).Password
+            $sec.Dispose()
+            if ([string]::IsNullOrEmpty($plain)) {
+                throw '密钥密码不能为空。'
+            }
+            if ($creatingNew) {
+                if ($plain.Length -lt 6) {
+                    throw '新密钥库密码长度至少需要 6 位。'
+                }
+                $sec2 = Read-Host '请再次输入密码确认' -AsSecureString
+                $plain2 = ([Net.NetworkCredential]::new('', $sec2)).Password
+                $sec2.Dispose()
+                if ($plain -cne $plain2) {
+                    $plain2 = $null
+                    throw '两次输入的密码不一致。'
+                }
+                $plain2 = $null
+            }
+            [Environment]::SetEnvironmentVariable('UNITY_AAB_STORE_PASSWORD', $plain)
+            $plain = $null
+        }
+
+        if (-not (Test-Path -LiteralPath $resolvedKs -PathType Leaf)) {
+            Write-Host ''
+            Write-Host "[密钥] 未找到密钥库，正在自动生成上传密钥库: $resolvedKs ..."
+            $genRes = & (Join-Path $PSScriptRoot 'Sign-Aab.ps1') -GenerateKeystore -KeystorePath $resolvedKs -KeyAlias $resolvedAlias
+            $expectedCert = [string]$genRes.CertificateSha256
+        }
+
+        $buildParams = @{
+            ProjectPath  = $target.ProjectPath
+            KeystorePath = $resolvedKs
+            KeyAlias     = $resolvedAlias
+        }
+        if (-not [string]::IsNullOrWhiteSpace($target.ConfigPath) -and (
+                [string]::IsNullOrWhiteSpace($cfgKs) -or [string]::Equals($resolvedKs, $cfgKs, [StringComparison]::OrdinalIgnoreCase)
+            )) {
+            $buildParams['ConfigPath'] = $target.ConfigPath
+        }
+        if (-not [string]::IsNullOrWhiteSpace($expectedCert)) {
+            $buildParams['ExpectedCertificateSha256'] = $expectedCert
+        }
+        if ($QaSigning) { $buildParams['QaSigning'] = $true }
+        if ($PrepareOnly) { $buildParams['PrepareOnly'] = $true }
+
+        Write-Host ''
+        Write-Host '[开始出包] 正在构建、签名并校验 AAB，请稍候...'
+        $res = & (Join-Path $PSScriptRoot 'Build-Unity-Aab.ps1') @buildParams
+
+        Write-Host ''
+        Write-Host '================================================='
+        Write-Host '  AAB 出包完成！'
+        Write-Host ("  文件路径 : {0}" -f $res.AabPath)
+        Write-Host ("  SHA-256  : {0}" -f $res.AabSha256)
+        Write-Host '================================================='
+
+        try {
+            Start-Process explorer.exe -ArgumentList "/select,`"$($res.AabPath)`"" | Out-Null
+        } catch {}
+
+        Write-Host ''
+        $setupAnswer = (Read-Host '是否顺便为该工程自动配置 GitHub Secrets 与本机 Runner？[y/N]').Trim().ToLowerInvariant()
+        if ($setupAnswer -eq 'y' -or $setupAnswer -eq 'yes') {
+            $setupParams = @{
+                ProjectPath  = $target.ProjectPath
+                KeystorePath = $resolvedKs
+                KeyAlias     = $resolvedAlias
+            }
+            if (-not [string]::IsNullOrWhiteSpace($res.CertificateSha256)) {
+                $setupParams['ExpectedCertificateSha256'] = $res.CertificateSha256
+            } elseif (-not [string]::IsNullOrWhiteSpace($expectedCert)) {
+                $setupParams['ExpectedCertificateSha256'] = $expectedCert
+            }
+            & (Join-Path $PSScriptRoot 'Setup-GitHub-Runner.ps1') @setupParams
+        }
+    } finally {
+        if ($hadStorePw) {
+            [Environment]::SetEnvironmentVariable('UNITY_AAB_STORE_PASSWORD', $origStorePw)
+        } else {
+            [Environment]::SetEnvironmentVariable('UNITY_AAB_STORE_PASSWORD', $null)
+        }
     }
 }
+
+Invoke-OneClickLocalAabBuild
