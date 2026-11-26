@@ -1,0 +1,37 @@
+{
+  "projectName": "MyUnityGame",
+  "projectPath": "C:\\Projects\\MyUnityGame",
+  "releaseJsonPath": "Assets\\Resources\\Release.json",
+  "build": {
+    "executeMethod": "",
+    "useUnityCliBuiltin": false,
+    "stagingAabRelativePath": "",
+    "minSdkVersion": 26,
+    "targetSdkVersion": 36,
+    "symbolType": "none"
+  },
+  "signing": {
+    "keystorePath": "C:\\Keys\\mygame-upload.p12",
+    "keyAlias": "mygame-upload",
+    "expectedCertificateSha256": "",
+    "storePasswordEnvVar": "UNITY_AAB_STORE_PASSWORD",
+    "keyPasswordEnvVar": "UNITY_AAB_KEY_PASSWORD"
+  },
+  "verify": {
+    "packageName": "com.example.mygame",
+    "expectedMinSdk": 26,
+    "expectedTargetSdk": 36,
+    "allowedAbis": [
+      "arm64-v8a"
+    ],
+    "requireIl2cpp": true,
+    "require16KbElfAlignment": true,
+    "requiredPermissions": [],
+    "requiredMetaData": {},
+    "requiredFeatures": {}
+  },
+  "release": {
+    "githubRepo": "owner/MyUnityGame",
+    "tagPrefix": "v"
+  }
+}

@@ -1,0 +1,14 @@
+out/
+Builds/
+*.aab
+*.apk
+*.p12
+*.keystore
+*.jks
+*.der
+*.log
+local-config/
+*.local.json
+Temp/
+.DS_Store
+Thumbs.db

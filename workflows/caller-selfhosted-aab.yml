@@ -1,0 +1,265 @@
+# Copy to <YourUnityRepo>/.github/workflows/android-aab.yml (or generate via Setup-GitHub-Runner.ps1 -InstallWorkflow)
+# Replace <OWNER> with the GitHub owner hosting Unity-Android-AAB-Workflow.
+name: __PROJECT_NAME__ Android Play AAB (Self-Hosted)
+
+on:
+  workflow_dispatch:
+    inputs:
+      android_version_code:
+        description: Optional explicit Android versionCode (> current Release.json value). Leave blank to use Release.json
+        required: false
+        type: string
+        default: ''
+      publish_draft_release:
+        description: Create or update a Draft GitHub Release for v<version> with the signed AAB
+        required: false
+        type: boolean
+        default: false
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: __PROJECT_NAME__-android-aab-self-hosted
+  cancel-in-progress: false
+
+jobs:
+  build-and-sign-aab:
+    name: Build, Verify & Sign Google Play AAB
+    runs-on: [self-hosted, windows, x64, __RUNNER_LABEL__]
+    timeout-minutes: 60
+    steps:
+      - name: Check out project repository
+        uses: actions/checkout@v4
+        with:
+          clean: false
+          persist-credentials: false
+
+      - name: Clean workspace while preserving Unity Library cache
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+          git checkout -- .
+          if ($LASTEXITCODE -ne 0) { throw "git checkout reset failed ($LASTEXITCODE)" }
+          git clean -ffdx -e Library/ -e Library
+          if ($LASTEXITCODE -ne 0) { throw "git clean failed ($LASTEXITCODE)" }
+
+      - name: Check out Unity-Android-AAB-Workflow toolkit
+        uses: actions/checkout@v4
+        with:
+          repository: <OWNER>/Unity-Android-AAB-Workflow
+          ref: main
+          path: _aab-workflow
+          persist-credentials: false
+
+      - name: Resolve version & validate Secrets
+        id: meta
+        shell: powershell
+        env:
+          HAS_KS_B64: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_BASE64 != '' }}
+          HAS_KS_PASS: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_PASSWORD != '' }}
+          HAS_KS_ALIAS: ${{ secrets.ANDROID_UPLOAD_KEY_ALIAS != '' }}
+          CERT_SHA_CHECK: ${{ secrets.ANDROID_UPLOAD_CERT_SHA256 }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION_CODE: ${{ inputs.android_version_code }}
+          INPUT_DRAFT_RELEASE: ${{ inputs.publish_draft_release }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+          . .\_aab-workflow\tools\Common.ps1
+
+          $cfgFile = '.\_aab-workflow\config\__CONFIG_FILE__'
+          $relPathCfg = ''
+          if (Test-Path -LiteralPath $cfgFile -PathType Leaf) {
+            $cfg = Get-Content -LiteralPath $cfgFile -Raw -Encoding UTF8 | ConvertFrom-Json
+            $relPathCfg = [string](Get-ConfigProperty -Object $cfg -Name 'releaseJsonPath' -Default '')
+          }
+          $meta = Read-UnityProjectMetadata -ProjectPath $PWD.Path -ReleaseJsonRelativePath $relPathCfg
+          if ([string]::IsNullOrWhiteSpace($meta.VersionName) -or $meta.VersionName -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Invalid version in project metadata: '$($meta.VersionName)'"
+          }
+          $version = $meta.VersionName
+          $versionCode = [int]$meta.VersionCode
+
+          if (-not [string]::IsNullOrWhiteSpace($env:INPUT_VERSION_CODE)) {
+            $overrideText = $env:INPUT_VERSION_CODE.Trim()
+            if ($overrideText -notmatch '^\d+$' -or [int]$overrideText -lt 1) {
+              throw "Invalid android_version_code '$overrideText'"
+            }
+            $overrideCode = [int]$overrideText
+            if ($overrideCode -lt $versionCode) {
+              throw "android_version_code ($overrideCode) must be >= Release.json code ($versionCode)."
+            }
+            $versionCode = $overrideCode
+            if (-not [string]::IsNullOrWhiteSpace($meta.ReleaseJsonPath)) {
+              $relObj = Get-Content -LiteralPath $meta.ReleaseJsonPath -Raw -Encoding UTF8 | ConvertFrom-Json
+              if ($null -ne $relObj.PSObject.Properties['androidVersionCode']) {
+                $relObj.androidVersionCode = $versionCode
+              } elseif ($null -ne $relObj.PSObject.Properties['versionCode']) {
+                $relObj.versionCode = $versionCode
+              }
+              $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+              [IO.File]::WriteAllText($meta.ReleaseJsonPath, ($relObj | ConvertTo-Json -Depth 6), $utf8NoBom)
+            }
+          }
+
+          $expectedTag = "v$version"
+          if ($env:REF_TYPE -eq 'tag' -and $env:REF_NAME -ne $expectedTag) {
+            throw "Git tag '$($env:REF_NAME)' does not match Release.json version '$expectedTag'."
+          }
+          if ($env:HAS_KS_B64 -ne 'true' -or $env:HAS_KS_PASS -ne 'true' -or $env:HAS_KS_ALIAS -ne 'true') {
+            throw 'Missing required Android signing Secrets (ANDROID_UPLOAD_KEYSTORE_BASE64 / PASSWORD / ALIAS). Run Setup-GitHub-Runner.ps1 first.'
+          }
+          $cleanSha = ($env:CERT_SHA_CHECK -replace '[:-]|\s', '').ToUpperInvariant()
+          if ($cleanSha -notmatch '^[0-9A-F]{64}$') {
+            throw 'Secret ANDROID_UPLOAD_CERT_SHA256 must be a valid 64-character SHA-256 hex digest.'
+          }
+
+          $shouldRelease = if ($env:EVENT_NAME -eq 'push' -or $env:INPUT_DRAFT_RELEASE -eq 'true') { 'true' } else { 'false' }
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "version=$version" -Encoding utf8
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "version_code=$versionCode" -Encoding utf8
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "tag_name=$expectedTag" -Encoding utf8
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "should_release=$shouldRelease" -Encoding utf8
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "out_dir=Builds\$version\AAB" -Encoding utf8
+          Write-Host "Validated __PROJECT_NAME__ $version (versionCode=$versionCode, shouldRelease=$shouldRelease)"
+
+      - name: Decode keystore, build, sign & verify Google Play AAB
+        shell: powershell
+        env:
+          UNITY_AAB_STORE_PASSWORD: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_PASSWORD }}
+          KEYSTORE_B64: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_BASE64 }}
+          KEY_ALIAS: ${{ secrets.ANDROID_UPLOAD_KEY_ALIAS }}
+          CERT_SHA256: ${{ secrets.ANDROID_UPLOAD_CERT_SHA256 }}
+          TARGET_VERSION: ${{ steps.meta.outputs.version }}
+          TARGET_VERSION_CODE: ${{ steps.meta.outputs.version_code }}
+          OUT_DIR: ${{ steps.meta.outputs.out_dir }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+
+          $tempKeystore = Join-Path $env:RUNNER_TEMP ("__PROJECT_NAME__-upload-" + $env:GITHUB_RUN_ID + ".p12")
+          $ksBytes = [Convert]::FromBase64String($env:KEYSTORE_B64.Trim())
+          if ($null -eq $ksBytes -or $ksBytes.Length -eq 0) { throw 'Decoded upload keystore is empty.' }
+          [IO.File]::WriteAllBytes($tempKeystore, $ksBytes)
+          [Array]::Clear($ksBytes, 0, $ksBytes.Length)
+
+          $buildParams = @{
+            ProjectPath                = $PWD.Path
+            OutputDir                  = (Join-Path $PWD.Path $env:OUT_DIR)
+            KeystorePath               = $tempKeystore
+            KeyAlias                   = $env:KEY_ALIAS
+            ExpectedCertificateSha256  = $env:CERT_SHA256
+            VersionCode                = [int]$env:TARGET_VERSION_CODE
+          }
+          $cfgFile = '.\_aab-workflow\config\__CONFIG_FILE__'
+          if (Test-Path -LiteralPath $cfgFile -PathType Leaf) {
+            $buildParams['ConfigPath'] = $cfgFile
+          }
+          $res = & .\_aab-workflow\Build-Unity-Aab.ps1 @buildParams
+
+          @(
+            "## __PROJECT_NAME__ Google Play AAB Summary"
+            ""
+            "- Version: ``$($res.VersionName)`` (``versionCode=$($res.VersionCode)``)"
+            "- Signed AAB: ``$(Split-Path -Leaf $res.AabPath)`` ($($res.SizeBytes) bytes)"
+            "- AAB SHA-256: ``$($res.AabSha256)``"
+            "- Upload Cert SHA-256: ``$($res.CertificateSha256)``"
+            "- Native Libs (16 KB ELF): ``$($res.Checked16KbCount) / $($res.NativeLibCount)``"
+          ) | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8
+
+      - name: Always wipe temporary signing material
+        if: always()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Get-ChildItem -LiteralPath $env:RUNNER_TEMP -Filter '*-upload-*.p12' -File -ErrorAction SilentlyContinue | ForEach-Object {
+            try {
+              if ($_.Length -gt 0) {
+                [IO.File]::WriteAllBytes($_.FullName, (New-Object byte[] ([int]$_.Length)))
+              }
+            } finally {
+              Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+            }
+          }
+          if (Test-Path -LiteralPath '_aab-workflow') {
+            Remove-Item -LiteralPath '_aab-workflow' -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Upload signed Google Play AAB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: __PROJECT_NAME__-${{ steps.meta.outputs.version }}-google-play-aab
+          path: |
+            ${{ steps.meta.outputs.out_dir }}/*-release.aab
+            ${{ steps.meta.outputs.out_dir }}/*-release.aab.sha256
+            ${{ steps.meta.outputs.out_dir }}/qa/aab-signature.txt
+            ${{ steps.meta.outputs.out_dir }}/qa/aab-verify.txt
+            ${{ steps.meta.outputs.out_dir }}/aab-build-summary.json
+          compression-level: 0
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Attach signed AAB to Draft GitHub Release
+        if: steps.meta.outputs.should_release == 'true'
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ steps.meta.outputs.tag_name }}
+          TARGET_VERSION: ${{ steps.meta.outputs.version }}
+          TARGET_VERSION_CODE: ${{ steps.meta.outputs.version_code }}
+          COMMIT_SHA: ${{ github.sha }}
+          OUT_DIR: ${{ steps.meta.outputs.out_dir }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-StrictMode -Version Latest
+          [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+          $headers = @{
+            Authorization          = "Bearer $($env:GH_TOKEN)"
+            Accept                 = 'application/vnd.github+json'
+            'X-GitHub-Api-Version' = '2022-11-28'
+            'User-Agent'           = '__PROJECT_NAME__-Actions-Release'
+          }
+          $repo = $env:GITHUB_REPOSITORY
+          $tag = $env:TAG_NAME
+          $releases = @(Invoke-RestMethod -Method Get -Uri "https://api.github.com/repos/$repo/releases?per_page=100" -Headers $headers)
+          $releaseObj = $releases | Where-Object { $null -ne $_ -and $_.tag_name -eq $tag } | Select-Object -First 1
+          if ($null -eq $releaseObj) {
+            $bodyJson = (@{
+              tag_name         = $tag
+              target_commitish = $env:COMMIT_SHA
+              name             = "__PROJECT_NAME__ $($env:TARGET_VERSION) (code $($env:TARGET_VERSION_CODE))"
+              body             = "Signed Google Play AAB built from commit $($env:COMMIT_SHA)."
+              draft            = $true
+              prerelease       = $false
+            } | ConvertTo-Json)
+            $releaseObj = Invoke-RestMethod -Method Post -Uri "https://api.github.com/repos/$repo/releases" -Headers $headers -Body $bodyJson -ContentType 'application/json; charset=utf-8'
+          }
+          $uploadBase = ($releaseObj.upload_url -replace '\{.*$', '')
+          $files = @(Get-ChildItem -LiteralPath $env:OUT_DIR -Filter '*-release.aab*' -File)
+          $sig = Join-Path $env:OUT_DIR 'qa\aab-signature.txt'
+          if (Test-Path -LiteralPath $sig -PathType Leaf) { $files += (Get-Item -LiteralPath $sig) }
+          foreach ($fi in $files) {
+            $existingAsset = @($releaseObj.assets) | Where-Object { $null -ne $_ -and $_.name -eq $fi.Name } | Select-Object -First 1
+            if ($null -ne $existingAsset) {
+              Invoke-RestMethod -Method Delete -Uri "https://api.github.com/repos/$repo/releases/assets/$($existingAsset.id)" -Headers $headers | Out-Null
+            }
+            $uploadUri = "${uploadBase}?name=$([Uri]::EscapeDataString($fi.Name))"
+            Invoke-RestMethod -Method Post -Uri $uploadUri -Headers $headers -InFile $fi.FullName -ContentType 'application/octet-stream' | Out-Null
+          }
+
+      - name: Upload QA logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: __PROJECT_NAME__-android-aab-qa-logs
+          path: |
+            ${{ steps.meta.outputs.out_dir }}/qa/*.log
+            ${{ steps.meta.outputs.out_dir }}/qa/*.txt
+          retention-days: 7
+          if-no-files-found: ignore
